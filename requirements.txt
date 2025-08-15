@@ -1,0 +1,4 @@
+fastapi~=0.116.1
+uvicorn[standard]
+yfinance~=0.2.65
+pydantic~=2.11.7
