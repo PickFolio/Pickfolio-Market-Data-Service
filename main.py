@@ -68,7 +68,7 @@ def get_quote(symbol: str):
     if price is None:
         raise HTTPException(
             status_code=404,
-            detail=f"Price not found for symbol: {symbol}. It may be an invalid ticker."
+            detail=f"Invalid ticker: Price not found for symbol: {symbol}."
         )
 
     return QuoteResponse(symbol=symbol, price=price)
