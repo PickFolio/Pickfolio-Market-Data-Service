@@ -1,4 +1,6 @@
-fastapi~=0.116.1
+fastapi
 uvicorn[standard]
-yfinance~=0.2.65
-pydantic~=2.11.7
+yfinance
+pydantic
+websockets
+httpx
