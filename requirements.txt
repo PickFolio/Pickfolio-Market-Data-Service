@@ -1,6 +1,8 @@
-fastapi
+fastapi~=0.116.1
 uvicorn[standard]
-yfinance
-pydantic
+yfinance~=0.2.65
+pydantic~=2.11.7
 websockets
-httpx
+httpx~=0.28.1
+pandas~=2.3.1
+pandas_market_calendars~=5.1.1
