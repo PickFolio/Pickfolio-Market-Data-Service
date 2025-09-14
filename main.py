@@ -14,7 +14,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Connection Manager (Using the simple global pattern) ---
+# --- Connection Manager ---
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -30,7 +30,6 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-# --- (Constants, Price Cache, is_market_open_india are unchanged) ---
 CONTEST_SERVICE_URL = "http://localhost:8081/api/internal/contests/active-symbols"
 last_known_prices: Dict[str, float] = {}
 def is_market_open_india() -> bool:
@@ -60,7 +59,8 @@ def fetch_prices_blocking(symbols: Set[str]) -> Dict[str, float]:
     logger.info("Blocking yfinance call finished.")
     return prices
 
-# --- Background Task (Now fully non-blocking and uses the global manager) ---
+
+# --- Background Task (Fully non-blocking and uses the global manager) ---
 async def broadcast_prices():
     global last_known_prices
     async with httpx.AsyncClient() as client:
@@ -90,7 +90,7 @@ async def broadcast_prices():
             await asyncio.sleep(15)
 
 
-# --- Lifespan (Now only starts the background task) ---
+# --- Lifespan (Only starts the background task) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(broadcast_prices())
@@ -105,12 +105,12 @@ app = FastAPI(lifespan=lifespan)
 class QuoteResponse(BaseModel):
     symbol: str
     price: float
+
 class ValidationResponse(BaseModel):
     symbol: str
     isValid: bool
 
 
-# --- API Endpoints (Reverted to simple, synchronous def) ---
 @app.get("/api/market-data/validate/{symbol}", response_model=ValidationResponse)
 def validate_symbol(symbol: str):
     ticker = yf.Ticker(symbol)
@@ -130,7 +130,7 @@ def get_quote(symbol: str):
     return QuoteResponse(symbol=symbol, price=price)
 
 
-# --- WebSocket Endpoint (Reverted to simple, single-argument version) ---
+# --- WebSocket Endpoint ---
 @app.websocket("/ws/market-data/prices")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
