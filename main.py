@@ -8,38 +8,32 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import pytz
 import json
+import logging
 
-# --- Connection Manager for WebSockets ---
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Connection Manager (Using the simple global pattern) ---
 class ConnectionManager:
-    def _init_(self):
+    def __init__(self):
         self.active_connections: List[WebSocket] = []
-
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-
     def disconnect(self, websocket: WebSocket):
         self.active_connections.remove(websocket)
-
     async def broadcast(self, message: str):
         for connection in self.active_connections:
             await connection.send_text(message)
 
-
 manager = ConnectionManager()
 
-# --- Constants ---
+
+# --- (Constants, Price Cache, is_market_open_india are unchanged) ---
 CONTEST_SERVICE_URL = "http://localhost:8081/api/internal/contests/active-symbols"
-
-# --- Price Cache ---
 last_known_prices: Dict[str, float] = {}
-
-
 def is_market_open_india() -> bool:
-    """
-    Determines whether the Indian stock market is currently open.
-    Market hours: Mon–Fri, 9:15 AM to 3:30 PM IST
-    """
     india_tz = pytz.timezone("Asia/Kolkata")
     now = datetime.now(india_tz)
     market_open = datetime.strptime("09:15", "%H:%M").time()
@@ -47,140 +41,97 @@ def is_market_open_india() -> bool:
     return now.weekday() < 5 and market_open <= now.time() <= market_close
 
 
-# --- Background Task for Price Fetching ---
+# --- Helper function to isolate all blocking yfinance code ---
+def fetch_prices_blocking(symbols: Set[str]) -> Dict[str, float]:
+    """This function contains all the slow, blocking yfinance code. It will be run in a separate thread."""
+    if not symbols:
+        return {}
+    logger.info(f"Executing blocking yfinance call for: {symbols}")
+    prices = {}
+    tickers = yf.Tickers(" ".join(symbols))
+    for symbol in symbols:
+        try:
+            info = tickers.tickers[symbol].info
+            price = (info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose"))
+            if price is not None:
+                prices[symbol] = price
+        except Exception as e:
+            logger.error(f"Error fetching yfinance price for {symbol}: {e}")
+    logger.info("Blocking yfinance call finished.")
+    return prices
+
+# --- Background Task (Now fully non-blocking and uses the global manager) ---
 async def broadcast_prices():
     global last_known_prices
-
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                # Step 1: Fetch active symbols
                 response = await client.get(CONTEST_SERVICE_URL)
-                if response.status_code != 200:
-                    print(f"Error fetching symbols from contest-service: {response.status_code}")
-                    await asyncio.sleep(15)
-                    continue
+                active_symbols: Set[str] = set(response.json()) if response.status_code == 200 and response.json() else set()
 
-                active_symbols: Set[str] = set(response.json())
                 if not active_symbols:
-                    print("No active symbols. Skipping.")
+                    logger.info("No active symbols. Sleeping for 15s.")
                     await asyncio.sleep(15)
                     continue
 
-                broadcast_data = {}
+                symbols_to_fetch = {s for s in active_symbols if is_market_open_india() or s not in last_known_prices}
 
-                if is_market_open_india():
-                    # ✅ Market is open: Always fetch fresh prices
-                    print("Market is open. Fetching fresh prices for active symbols.")
-                    tickers = yf.Tickers(" ".join(active_symbols))
+                if symbols_to_fetch:
+                    new_prices = await asyncio.to_thread(fetch_prices_blocking, symbols_to_fetch)
+                    last_known_prices.update(new_prices)
 
-                    for symbol in active_symbols:
-                        try:
-                            info = tickers.tickers[symbol].info
-                            price = (
-                                    info.get("currentPrice")
-                                    or info.get("regularMarketPrice")
-                                    or info.get("previousClose")
-                            )
-                            if price is not None:
-                                last_known_prices[symbol] = price
-                                broadcast_data[symbol] = price
-                        except Exception as e:
-                            print(f"Error fetching price for {symbol}: {e}")
-
-                else:
-                    # 🔒 Market is closed: Use cache if available, fetch only missing ones
-                    print("Market is closed. Using cached prices where available.")
-                    symbols_to_fetch = set()
-
-                    for symbol in active_symbols:
-                        cached_price = last_known_prices.get(symbol)
-                        if cached_price is not None:
-                            broadcast_data[symbol] = cached_price
-                        else:
-                            symbols_to_fetch.add(symbol)
-
-                    if symbols_to_fetch:
-                        print(f"Fetching missing prices: {symbols_to_fetch}")
-                        tickers = yf.Tickers(" ".join(symbols_to_fetch))
-                        for symbol in symbols_to_fetch:
-                            try:
-                                info = tickers.tickers[symbol].info
-                                price = (
-                                        info.get("currentPrice")
-                                        or info.get("regularMarketPrice")
-                                        or info.get("previousClose")
-                                )
-                                if price is not None:
-                                    last_known_prices[symbol] = price
-                                    broadcast_data[symbol] = price
-                            except Exception as e:
-                                print(f"Error fetching price for {symbol}: {e}")
-
+                broadcast_data = {s: p for s, p in last_known_prices.items() if s in active_symbols}
                 if broadcast_data:
                     await manager.broadcast(json.dumps(broadcast_data))
-                    print(f"[{datetime.now()}] Broadcasted: {broadcast_data}")
-                else:
-                    print("Nothing to broadcast.")
+                    logger.info(f"Broadcasted: {broadcast_data}")
 
-            except httpx.RequestError as e:
-                print(f"Could not connect to contest-service: {e}")
             except Exception as e:
-                print(f"An error occurred in the broadcast loop: {e}")
-
+                logger.error(f"An error occurred in the broadcast loop: {e}")
             await asyncio.sleep(15)
 
 
-# --- Lifespan Context Manager ---
+# --- Lifespan (Now only starts the background task) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(broadcast_prices())
-    print("Background price broadcasting task started.")
     yield
 
 
-# --- FastAPI App and Endpoints ---
-app = FastAPI(
-    title="PickFolio Market Data Service",
-    description="Provides stock market data for the PickFolio game.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+# --- FastAPI App ---
+app = FastAPI(lifespan=lifespan)
 
-# --- Pydantic Models for API Responses ---
 
+# --- Pydantic Models (Unchanged) ---
 class QuoteResponse(BaseModel):
     symbol: str
     price: float
-
 class ValidationResponse(BaseModel):
     symbol: str
     isValid: bool
 
 
-@app.get("/api/market-data/validate/{symbol}", response_model=ValidationResponse, tags=["Market Data"])
+# --- API Endpoints (Reverted to simple, synchronous def) ---
+@app.get("/api/market-data/validate/{symbol}", response_model=ValidationResponse)
 def validate_symbol(symbol: str):
     ticker = yf.Ticker(symbol)
     if not ticker.info or ticker.info.get('regularMarketPrice') is None:
         return ValidationResponse(symbol=symbol, isValid=False)
     return ValidationResponse(symbol=symbol, isValid=True)
 
-
-@app.get("/api/market-data/quote/{symbol}", response_model=QuoteResponse, tags=["Market Data"])
+@app.get("/api/market-data/quote/{symbol}", response_model=QuoteResponse)
 def get_quote(symbol: str):
     ticker = yf.Ticker(symbol)
     price = ticker.fast_info.get('last_price')
-
     if price is None:
         info = ticker.info
         price = info.get('regularMarketPrice')
-
     if price is None:
-        raise HTTPException(status_code=404, detail=f"Price not found for symbol: {symbol}")
+        raise HTTPException(status_code=404, detail="Price not found")
     return QuoteResponse(symbol=symbol, price=price)
 
 
-@app.websocket("/ws/prices")
+# --- WebSocket Endpoint (Reverted to simple, single-argument version) ---
+@app.websocket("/ws/market-data/prices")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
@@ -188,3 +139,4 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
