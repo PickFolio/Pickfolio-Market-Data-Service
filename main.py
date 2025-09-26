@@ -9,6 +9,10 @@ from datetime import datetime
 import pytz
 import json
 import logging
+import os
+
+# Get the URL from the environment variable, with a fallback for local dev
+CONTEST_SERVICE_URL = os.environ.get("CONTEST_SERVICE_URL", "http://localhost:8081/api/internal/contests/active-symbols")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +34,6 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-CONTEST_SERVICE_URL = "http://localhost:8081/api/internal/contests/active-symbols"
 last_known_prices: Dict[str, float] = {}
 def is_market_open_india() -> bool:
     india_tz = pytz.timezone("Asia/Kolkata")
