@@ -2,7 +2,7 @@ import asyncio
 import httpx
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -113,6 +113,11 @@ class ValidationResponse(BaseModel):
     symbol: str
     isValid: bool
 
+class SearchResult(BaseModel):
+    symbol: str
+    name: str
+    type: str
+
 
 @app.get("/api/market-data/validate/{symbol}", response_model=ValidationResponse)
 def validate_symbol(symbol: str):
@@ -131,6 +136,48 @@ def get_quote(symbol: str):
     if price is None:
         raise HTTPException(status_code=404, detail="Price not found")
     return QuoteResponse(symbol=symbol, price=price)
+
+@app.get("/api/market-data/search", response_model=List[SearchResult])
+async def search_stocks(query: str):
+    """
+    Searches for stocks matching the query using Yahoo Finance's Typeahead API.
+    Restricts results to Indian stocks (.NS or .BO) for this contest context.
+    """
+    if not query:
+        return []
+
+    url = "https://query2.finance.yahoo.com/v1/finance/search"
+    params = {
+        "q": query,
+        "quotesCount": 10,
+        "newsCount": 0,
+        "enableFuzzyQuery": "false",
+        "quotesQueryId": "tss_match_phrase_query"
+    }
+    # Yahoo requires a User-Agent
+    headers = {'User-Agent': 'Mozilla/5.0'}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, params=params, headers=headers)
+            data = response.json()
+
+            results = []
+            if "quotes" in data:
+                for quote in data["quotes"]:
+                    # Filter for Equity and Indian Markets (NSE/BSE)
+                    # You can remove the '.NS' filter if you want to support US stocks too
+                    symbol = quote.get("symbol", "")
+                    if ".NS" in symbol or ".BO" in symbol:
+                        results.append(SearchResult(
+                            symbol=symbol,
+                            name=quote.get("longname") or quote.get("shortname") or symbol,
+                            type=quote.get("quoteType", "Unknown")
+                        ))
+            return results
+        except Exception as e:
+            logger.error(f"Error searching symbols: {e}")
+            return []
 
 
 # --- WebSocket Endpoint ---
