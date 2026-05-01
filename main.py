@@ -100,8 +100,47 @@ async def lifespan(app: FastAPI):
     yield
 
 
+from fastapi.middleware.cors import CORSMiddleware
+
 # --- FastAPI App ---
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/api/market-data/history/{symbol}")
+async def get_stock_history(symbol: str, range: str = "1mo", interval: str = "1d"):
+    """
+    Fetches historical OHLC data for a symbol.
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=range, interval=interval)
+        
+        if df.empty:
+            return []
+            
+        results = []
+        for index, row in df.iterrows():
+            # lightweight-charts expects time as unix timestamp (seconds) or 'YYYY-MM-DD'
+            timestamp = int(index.timestamp())
+            results.append({
+                "time": timestamp,
+                "open": row["Open"],
+                "high": row["High"],
+                "low": row["Low"],
+                "close": row["Close"],
+                "value": row["Volume"]
+            })
+        return results
+    except Exception as e:
+        logger.error(f"Error fetching history for {symbol}: {e}")
+        return []
 
 
 # --- Pydantic Models (Unchanged) ---
@@ -117,6 +156,14 @@ class SearchResult(BaseModel):
     symbol: str
     name: str
     type: str
+
+class HistoricalDataPoint(BaseModel):
+    time: str | int
+    open: float
+    high: float
+    low: float
+    close: float
+    value: float
 
 
 @app.get("/api/market-data/validate/{symbol}", response_model=ValidationResponse)
@@ -149,10 +196,10 @@ async def search_stocks(query: str):
     url = "https://query2.finance.yahoo.com/v1/finance/search"
     params = {
         "q": query,
-        "quotesCount": 10,
+        "quotesCount": 100, # Increased from 10 to catch more regional results
         "newsCount": 0,
-        "enableFuzzyQuery": "false",
-        "quotesQueryId": "tss_match_phrase_query"
+        "region": "IN", # Bias towards India
+        "lang": "en-IN"
     }
     # Yahoo requires a User-Agent
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -166,7 +213,6 @@ async def search_stocks(query: str):
             if "quotes" in data:
                 for quote in data["quotes"]:
                     # Filter for Equity and Indian Markets (NSE/BSE)
-                    # You can remove the '.NS' filter if you want to support US stocks too
                     symbol = quote.get("symbol", "")
                     if ".NS" in symbol or ".BO" in symbol:
                         results.append(SearchResult(
@@ -174,7 +220,7 @@ async def search_stocks(query: str):
                             name=quote.get("longname") or quote.get("shortname") or symbol,
                             type=quote.get("quoteType", "Unknown")
                         ))
-            return results
+            return results[:15] # Return top 15 Indian matches
         except Exception as e:
             logger.error(f"Error searching symbols: {e}")
             return []
