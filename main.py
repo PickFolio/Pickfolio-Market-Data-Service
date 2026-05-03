@@ -144,6 +144,11 @@ async def get_stock_history(symbol: str, range: str = "1mo", interval: str = "1d
 
 
 # --- Pydantic Models (Unchanged) ---
+class PulseResponse(BaseModel):
+    symbol: str
+    move: str
+    tone: str
+
 class QuoteResponse(BaseModel):
     symbol: str
     price: float
@@ -165,6 +170,29 @@ class HistoricalDataPoint(BaseModel):
     close: float
     value: float
 
+
+@app.get("/api/market-data/pulse", response_model=List[PulseResponse])
+def get_market_pulse():
+    indices = {"^NSEI": "NIFTY", "^NSEBANK": "BANK", "^CNXIT": "IT"}
+    results = []
+    tickers = yf.Tickers(" ".join(indices.keys()))
+    for symbol, name in indices.items():
+        try:
+            info = tickers.tickers[symbol].info
+            current = info.get("regularMarketPrice") or info.get("currentPrice")
+            prev_close = info.get("regularMarketPreviousClose") or info.get("previousClose")
+            
+            if current is not None and prev_close is not None and prev_close > 0:
+                change_percent = ((current - prev_close) / prev_close) * 100
+                move_str = f"{'+' if change_percent >= 0 else ''}{change_percent:.2f}%"
+                tone = 'var(--color-success)' if change_percent >= 0 else 'var(--color-error)'
+                results.append(PulseResponse(symbol=name, move=move_str, tone=tone))
+            else:
+                results.append(PulseResponse(symbol=name, move="0.00%", tone="var(--color-success)"))
+        except Exception as e:
+            logger.error(f"Error fetching pulse for {symbol}: {e}")
+            results.append(PulseResponse(symbol=name, move="0.00%", tone="var(--color-success)"))
+    return results
 
 @app.get("/api/market-data/validate/{symbol}", response_model=ValidationResponse)
 def validate_symbol(symbol: str):
