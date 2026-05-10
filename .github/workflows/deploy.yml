@@ -59,7 +59,7 @@ jobs:
             --exclude '__pycache__/' \
             --exclude '.venv/' \
             --exclude 'venv/' \
-            ./ "oracle-vm:${REMOTE_DIR// /\\ }/"
+            ./ "oracle-vm:${REMOTE_DIR}/"
 
       - name: Rebuild and restart market-data-service
         env:
@@ -82,5 +82,6 @@ jobs:
             fi
             \$COMPOSE build market-data-service
             \$COMPOSE up -d --no-deps market-data-service
+            \$COMPOSE restart pickfolio-ui
             docker image prune -f
           "
