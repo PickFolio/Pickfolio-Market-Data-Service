@@ -196,7 +196,8 @@ def fetch_market_movers_blocking() -> MarketMoversResponse:
 async def broadcast_prices_loop():
     global last_known_prices
     logger.info("Starting broadcast prices loop...")
-    await asyncio.sleep(5)
+    # Give contest-service plenty of time to boot and establish DB connections
+    await asyncio.sleep(15)
     
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
@@ -219,6 +220,11 @@ async def broadcast_prices_loop():
                         broadcast_data = {s: p for s, p in last_known_prices.items() if s in active_symbols}
                         if broadcast_data:
                             await manager.broadcast(json.dumps(broadcast_data))
+            except httpx.ConnectError as e:
+                logger.error(f"Failed to connect to Contest Service at {CONTEST_SERVICE_URL}. Is it running? Error: {e}")
+                # Longer backoff if the service is completely unreachable
+                await asyncio.sleep(30)
+                continue
             except Exception as e:
                 logger.error(f"Error in broadcast loop: {e}")
             await asyncio.sleep(15)
