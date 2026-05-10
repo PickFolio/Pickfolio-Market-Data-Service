@@ -30,6 +30,15 @@ jobs:
           printf '%s\n' "$ORACLE_SSH_KEY" > ~/.ssh/oracle.key
           chmod 600 ~/.ssh/oracle.key
           ssh-keyscan -p "$PORT" "$ORACLE_HOST" >> ~/.ssh/known_hosts
+          {
+            echo "Host oracle-vm"
+            echo "  HostName $ORACLE_HOST"
+            echo "  Port $PORT"
+            echo "  UserKnownHostsFile ~/.ssh/known_hosts"
+            echo "  IdentityFile ~/.ssh/oracle.key"
+            echo "  ServerAliveInterval 30"
+            echo "  ServerAliveCountMax 10"
+          } >> ~/.ssh/config
 
       - name: Sync service to Oracle VM
         env:
@@ -41,17 +50,16 @@ jobs:
           set -euo pipefail
           PORT="${ORACLE_PORT:-22}"
           APP_DIR="${ORACLE_APP_DIR:-/home/ubuntu/pickfolio}"
-          REMOTE="${ORACLE_USER}@${ORACLE_HOST}"
           REMOTE_DIR="${APP_DIR}/Backend/Market Data Service"
-          ssh -i ~/.ssh/oracle.key -p "$PORT" "$REMOTE" "mkdir -p '${REMOTE_DIR}'"
+          ssh -F ~/.ssh/config -l "$ORACLE_USER" oracle-vm "mkdir -p '${REMOTE_DIR}'"
           rsync -az --delete \
-            -e "ssh -i ~/.ssh/oracle.key -p ${PORT}" \
+            -e "ssh -F ~/.ssh/config -l ${ORACLE_USER}" \
             --exclude '.git/' \
             --exclude '.github/' \
             --exclude '__pycache__/' \
             --exclude '.venv/' \
             --exclude 'venv/' \
-            ./ "${REMOTE}:${REMOTE_DIR// /\\ }/"
+            ./ "oracle-vm:${REMOTE_DIR// /\\ }/"
 
       - name: Rebuild and restart market-data-service
         env:
@@ -63,15 +71,16 @@ jobs:
           set -euo pipefail
           PORT="${ORACLE_PORT:-22}"
           APP_DIR="${ORACLE_APP_DIR:-/home/ubuntu/pickfolio}"
-          REMOTE="${ORACLE_USER}@${ORACLE_HOST}"
-          ssh -i ~/.ssh/oracle.key -p "$PORT" "$REMOTE" "
+          ssh -F ~/.ssh/config -l "$ORACLE_USER" oracle-vm "
             set -e
             cd '${APP_DIR}'
+            export COMPOSE_BAKE=false
             if docker compose version >/dev/null 2>&1; then
               COMPOSE='docker compose'
             else
               COMPOSE='docker-compose'
             fi
-            \$COMPOSE up -d --build market-data-service
+            \$COMPOSE build market-data-service
+            \$COMPOSE up -d --no-deps market-data-service
             docker image prune -f
           "
