@@ -1,0 +1,77 @@
+name: Deploy Market Data Service
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: pickfolio-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_PORT: ${{ secrets.ORACLE_PORT }}
+          ORACLE_SSH_KEY: ${{ secrets.ORACLE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          PORT="${ORACLE_PORT:-22}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$ORACLE_SSH_KEY" > ~/.ssh/oracle.key
+          chmod 600 ~/.ssh/oracle.key
+          ssh-keyscan -p "$PORT" "$ORACLE_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync service to Oracle VM
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_PORT: ${{ secrets.ORACLE_PORT }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_APP_DIR: ${{ secrets.ORACLE_APP_DIR }}
+        run: |
+          set -euo pipefail
+          PORT="${ORACLE_PORT:-22}"
+          APP_DIR="${ORACLE_APP_DIR:-/home/ubuntu/pickfolio}"
+          REMOTE="${ORACLE_USER}@${ORACLE_HOST}"
+          REMOTE_DIR="${APP_DIR}/Backend/Market Data Service"
+          ssh -i ~/.ssh/oracle.key -p "$PORT" "$REMOTE" "mkdir -p '${REMOTE_DIR}'"
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/oracle.key -p ${PORT}" \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '__pycache__/' \
+            --exclude '.venv/' \
+            --exclude 'venv/' \
+            ./ "${REMOTE}:${REMOTE_DIR// /\\ }/"
+
+      - name: Rebuild and restart market-data-service
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_PORT: ${{ secrets.ORACLE_PORT }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_APP_DIR: ${{ secrets.ORACLE_APP_DIR }}
+        run: |
+          set -euo pipefail
+          PORT="${ORACLE_PORT:-22}"
+          APP_DIR="${ORACLE_APP_DIR:-/home/ubuntu/pickfolio}"
+          REMOTE="${ORACLE_USER}@${ORACLE_HOST}"
+          ssh -i ~/.ssh/oracle.key -p "$PORT" "$REMOTE" "
+            set -e
+            cd '${APP_DIR}'
+            if docker compose version >/dev/null 2>&1; then
+              COMPOSE='docker compose'
+            else
+              COMPOSE='docker-compose'
+            fi
+            \$COMPOSE up -d --build market-data-service
+            docker image prune -f
+          "
