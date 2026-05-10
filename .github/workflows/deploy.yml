@@ -51,9 +51,9 @@ jobs:
           PORT="${ORACLE_PORT:-22}"
           APP_DIR="${ORACLE_APP_DIR:-/home/ubuntu/pickfolio}"
           REMOTE_DIR="${APP_DIR}/Backend/Market Data Service"
-          ssh -F ~/.ssh/config -l "$ORACLE_USER" oracle-vm "mkdir -p '${REMOTE_DIR}'"
+          ssh -F "$HOME/.ssh/config" -l "$ORACLE_USER" oracle-vm "mkdir -p '${REMOTE_DIR}'"
           rsync -az --delete \
-            -e "ssh -F ~/.ssh/config -l ${ORACLE_USER}" \
+            -e "ssh -F $HOME/.ssh/config -l ${ORACLE_USER}" \
             --exclude '.git/' \
             --exclude '.github/' \
             --exclude '__pycache__/' \
@@ -71,7 +71,7 @@ jobs:
           set -euo pipefail
           PORT="${ORACLE_PORT:-22}"
           APP_DIR="${ORACLE_APP_DIR:-/home/ubuntu/pickfolio}"
-          ssh -F ~/.ssh/config -l "$ORACLE_USER" oracle-vm "
+          ssh -F "$HOME/.ssh/config" -l "$ORACLE_USER" oracle-vm "
             set -e
             cd '${APP_DIR}'
             export COMPOSE_BAKE=false
