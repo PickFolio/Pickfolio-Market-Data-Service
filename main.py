@@ -25,6 +25,16 @@ class PulseResponse(BaseModel):
     tone: str
     sparkline: List[float]
 
+class Mover(BaseModel):
+    symbol: str
+    price: float
+    change: float
+    pChange: float
+
+class MarketMoversResponse(BaseModel):
+    gainers: List[Mover]
+    losers: List[Mover]
+
 class QuoteResponse(BaseModel):
     symbol: str
     price: float
@@ -55,6 +65,7 @@ cached_pulse_data: List[PulseResponse] = [
     PulseResponse(symbol="BANK", move="0.00%", tone="var(--text-secondary)", sparkline=[]),
     PulseResponse(symbol="IT", move="0.00%", tone="var(--text-secondary)", sparkline=[]),
 ]
+cached_market_movers: MarketMoversResponse = MarketMoversResponse(gainers=[], losers=[])
 
 # --- Connection Manager ---
 class ConnectionManager:
@@ -142,6 +153,45 @@ def fetch_pulse_blocking() -> List[PulseResponse]:
     
     return results
 
+def fetch_market_movers_blocking() -> MarketMoversResponse:
+    logger.info("Fetching market movers from NSE NIFTY 500...")
+    try:
+        with httpx.Client(timeout=15.0, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}) as client:
+            client.get('https://www.nseindia.com')
+            
+            res = client.get('https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500')
+            
+            if res.status_code != 200:
+                raise Exception(f"NSE API Error: {res.status_code}")
+                
+            data = res.json().get('data', [])
+            
+            # Filter out the index itself
+            stocks = [d for d in data if d.get('symbol') != 'NIFTY 500']
+            
+            # Sort by percentage change (highest first)
+            sorted_stocks = sorted(stocks, key=lambda x: float(x.get('pChange', 0)), reverse=True)
+            
+            gainers = []
+            for g in sorted_stocks[:5]:
+                ltp = float(g.get('lastPrice') or 0)
+                change = float(g.get('change') or 0)
+                pChange = float(g.get('pChange') or 0)
+                gainers.append(Mover(symbol=g['symbol'] + '.NS', price=ltp, change=change, pChange=pChange))
+            
+            # Bottom 5 (lowest negative change first)
+            losers = []
+            for l in sorted_stocks[-5:][::-1]:
+                ltp = float(l.get('lastPrice') or 0)
+                change = float(l.get('change') or 0)
+                pChange = float(l.get('pChange') or 0)
+                losers.append(Mover(symbol=l['symbol'] + '.NS', price=ltp, change=change, pChange=pChange))
+            
+            return MarketMoversResponse(gainers=gainers, losers=losers)
+    except Exception as e:
+        logger.error(f"Error fetching market movers: {e}")
+        return MarketMoversResponse(gainers=[], losers=[])
+
 # --- Background Tasks ---
 async def broadcast_prices_loop():
     global last_known_prices
@@ -195,10 +245,34 @@ async def update_pulse_cache_loop():
             logger.error(f"Error in pulse cache loop: {e}")
         await asyncio.sleep(300)
 
+async def update_market_movers_cache_loop():
+    global cached_market_movers
+    logger.info("Starting market movers cache loop...")
+    await asyncio.sleep(4)
+
+    while True:
+        try:
+            logger.info("Initiating market movers cache update...")
+            try:
+                new_movers = await asyncio.wait_for(
+                    asyncio.to_thread(fetch_market_movers_blocking),
+                    timeout=30.0
+                )
+                if new_movers and (new_movers.gainers or new_movers.losers):
+                    cached_market_movers = new_movers
+                    logger.info("Market movers cache updated successfully.")
+            except asyncio.TimeoutError:
+                logger.warning("Market movers fetch timed out")
+        except Exception as e:
+            logger.error(f"Error in market movers cache loop: {e}")
+        # Update hourly (3600 seconds) since we don't want to overburden NSE API
+        await asyncio.sleep(3600)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(broadcast_prices_loop())
     asyncio.create_task(update_pulse_cache_loop())
+    asyncio.create_task(update_market_movers_cache_loop())
     yield
 
 # --- FastAPI App ---
@@ -220,6 +294,10 @@ async def health_check():
 @app.get("/api/market-data/pulse", response_model=List[PulseResponse])
 async def get_market_pulse():
     return cached_pulse_data
+
+@app.get("/api/market-data/trending", response_model=MarketMoversResponse)
+async def get_trending():
+    return cached_market_movers
 
 @app.get("/api/market-data/history/{symbol}")
 async def get_stock_history(symbol: str, range: str = "1mo", interval: str = "1d"):
