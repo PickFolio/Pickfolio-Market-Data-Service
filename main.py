@@ -154,12 +154,12 @@ def fetch_pulse_blocking() -> List[PulseResponse]:
     return results
 
 def fetch_market_movers_blocking() -> MarketMoversResponse:
-    logger.info("Fetching market movers from NSE NIFTY 500...")
+    logger.info("Fetching market movers from NSE NIFTY TOTAL MARKET...")
     try:
         with httpx.Client(timeout=15.0, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}) as client:
             client.get('https://www.nseindia.com')
             
-            res = client.get('https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20500')
+            res = client.get('https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20TOTAL%20MARKET')
             
             if res.status_code != 200:
                 raise Exception(f"NSE API Error: {res.status_code}")
@@ -167,7 +167,7 @@ def fetch_market_movers_blocking() -> MarketMoversResponse:
             data = res.json().get('data', [])
             
             # Filter out the index itself
-            stocks = [d for d in data if d.get('symbol') != 'NIFTY 500']
+            stocks = [d for d in data if d.get('symbol') != 'NIFTY TOTAL MARKET']
             
             # Sort by percentage change (highest first)
             sorted_stocks = sorted(stocks, key=lambda x: float(x.get('pChange', 0)), reverse=True)
