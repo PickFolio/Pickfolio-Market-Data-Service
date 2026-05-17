@@ -38,6 +38,7 @@ class MarketMoversResponse(BaseModel):
 class QuoteResponse(BaseModel):
     symbol: str
     price: float
+    changePercent: float = 0.0
 
 class ValidationResponse(BaseModel):
     symbol: str
@@ -334,12 +335,21 @@ async def get_quote(symbol: str):
     try:
         ticker = yf.Ticker(symbol)
         hist = await asyncio.wait_for(
-            asyncio.to_thread(ticker.history, period="1d"),
+            asyncio.to_thread(ticker.history, period="5d", interval="1d"),
             timeout=10.0
         )
         if hist.empty:
             raise HTTPException(status_code=404, detail="Price not found")
-        return QuoteResponse(symbol=symbol, price=float(hist['Close'].iloc[-1]))
+            
+        current_price = float(hist['Close'].iloc[-1])
+        change_percent = 0.0
+        if len(hist) >= 2:
+            prev_close = float(hist['Close'].iloc[-2])
+            change_percent = ((current_price - prev_close) / prev_close) * 100
+            
+        return QuoteResponse(symbol=symbol, price=current_price, changePercent=change_percent)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Quote fetch failed for {symbol}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
