@@ -51,15 +51,16 @@ jobs:
           PORT="${ORACLE_PORT:-22}"
           APP_DIR="${ORACLE_APP_DIR:-/home/ubuntu/pickfolio}"
           REMOTE_DIR="${APP_DIR}/Backend/Market Data Service"
-          ssh -F "$HOME/.ssh/config" -l "$ORACLE_USER" oracle-vm "mkdir -p '${REMOTE_DIR}'"
-          rsync -az --delete \
+          REMOTE_DIR_ESCAPED="$(printf '%q' "$REMOTE_DIR")"
+          ssh -F "$HOME/.ssh/config" -l "$ORACLE_USER" oracle-vm "mkdir -p $REMOTE_DIR_ESCAPED"
+          rsync -azs --delete \
             -e "ssh -F $HOME/.ssh/config -l ${ORACLE_USER}" \
             --exclude '.git/' \
             --exclude '.github/' \
             --exclude '__pycache__/' \
             --exclude '.venv/' \
             --exclude 'venv/' \
-            ./ "oracle-vm:'${REMOTE_DIR}/'"
+            ./ "oracle-vm:${REMOTE_DIR}/"
 
       - name: Rebuild and restart market-data-service
         env:
