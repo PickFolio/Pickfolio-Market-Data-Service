@@ -59,7 +59,7 @@ jobs:
             --exclude '__pycache__/' \
             --exclude '.venv/' \
             --exclude 'venv/' \
-            ./ "oracle-vm:${REMOTE_DIR}/"
+            ./ "oracle-vm:'${REMOTE_DIR}/'"
 
       - name: Rebuild and restart market-data-service
         env:
