@@ -7,3 +7,8 @@ httpx~=0.28.1
 pandas~=2.3.1
 pandas_market_calendars~=5.1.1
 pytz~=2025.2
+psycopg[binary]==3.2.3
+SQLAlchemy~=2.0.30
+beautifulsoup4~=4.12.3
+transformers~=4.40.0
+torch~=2.3.0
