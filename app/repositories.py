@@ -46,6 +46,8 @@ class NewsHeadline:
     published_at: datetime | None = None
     url: str | None = None
     sentiment_score: float | None = None
+    sentiment_method: str | None = None
+    event_type: str | None = None
     volume: int = 0
     p_change: float = 0.0
     raw_payload: dict[str, Any] | None = None
@@ -271,17 +273,21 @@ def archive_news_headlines(headlines: Iterable[NewsHeadline]) -> int:
                     published_at,
                     url,
                     sentiment_score,
+                    sentiment_method,
+                    event_type,
                     volume,
                     p_change,
                     raw_payload
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (symbol, headline, fetch_date) WHERE btrim(headline) <> ''
                 DO UPDATE SET
                     source = EXCLUDED.source,
                     published_at = COALESCE(EXCLUDED.published_at, market_news_archive.published_at),
                     url = COALESCE(EXCLUDED.url, market_news_archive.url),
-                    sentiment_score = COALESCE(EXCLUDED.sentiment_score, market_news_archive.sentiment_score),
+                    sentiment_score = EXCLUDED.sentiment_score,
+                    sentiment_method = EXCLUDED.sentiment_method,
+                    event_type = EXCLUDED.event_type,
                     volume = EXCLUDED.volume,
                     p_change = EXCLUDED.p_change,
                     raw_payload = EXCLUDED.raw_payload
@@ -296,6 +302,8 @@ def archive_news_headlines(headlines: Iterable[NewsHeadline]) -> int:
                         row.published_at,
                         row.url,
                         row.sentiment_score,
+                        row.sentiment_method,
+                        row.event_type,
                         row.volume,
                         row.p_change,
                         Jsonb(row.raw_payload or {}),
@@ -324,7 +332,7 @@ def get_market_news_archive_summary() -> dict:
             row = cur.fetchone()
             cur.execute(
                 """
-                SELECT symbol, headline, fetch_time, sentiment_score
+                SELECT symbol, headline, fetch_time, sentiment_score, sentiment_method, event_type
                 FROM market_news_archive
                 ORDER BY fetch_time DESC
                 LIMIT 5
@@ -336,6 +344,8 @@ def get_market_news_archive_summary() -> dict:
                     "headline": item[1],
                     "fetch_time": item[2].isoformat() if item[2] else None,
                     "sentiment_score": item[3],
+                    "sentiment_method": item[4],
+                    "event_type": item[5],
                 }
                 for item in cur.fetchall()
             ]

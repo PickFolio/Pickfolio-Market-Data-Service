@@ -88,9 +88,34 @@ Rows are not deleted automatically. If a stock leaves the core universe, update 
 
 News ingestion uses `stock_master` as its source of symbols. It runs daily at 07:00 IST by default, does not call NSE for the NIFTY Total Market, and does not fall back to hardcoded symbols. If `stock_master` is empty, the ingestion run records an empty universe instead of fetching unrelated symbols.
 
-Full-universe intraday scanning is disabled by default because it competes with market movers and can overload small machines. Reactive catalyst fetches remain available through `/catalysts`. FinBERT sentiment scoring is also disabled by default; headline ingestion persists raw headlines first, and sentiment can be enabled later with `NEWS_SENTIMENT_ENABLED=true` or moved to a separate offline signal worker.
+Full-universe intraday scanning is disabled by default because it competes with market movers and can overload small machines. Reactive catalyst fetches remain available through `/catalysts`.
 
-Successful yfinance news fetches are persisted to `market_news_archive`. This includes both scheduled batch ingestion and reactive `/catalysts` requests.
+Successful yfinance news fetches are persisted to `market_news_archive`. This includes both scheduled batch ingestion and reactive `/catalysts` requests. Each stored headline is scored locally with `impact_v1`; FinBERT is not loaded or used.
+
+`sentiment_score` is now treated as an intrinsic market impact score:
+
+```text
+-1.0 = strongly bearish impact
+ 0.0 = neutral / low impact
++1.0 = strongly bullish impact
+```
+
+The `impact_v1` scorer is deterministic and lightweight:
+
+1. Event type is the primary signal. Rules classify headlines into events such as `ORDER_WIN`, `EARNINGS_BEAT`, `EARNINGS_MISS`, `REGULATORY_APPROVAL`, `REGULATORY_ACTION`, `ANALYST_UPGRADE`, `ANALYST_DOWNGRADE`, and `MANAGEMENT_EXIT`.
+2. Each event type has a base impact. For example, order wins, approvals, earnings beats, and upgrades start positive; probes, penalties, earnings misses, downgrades, defaults, and management exits start negative.
+3. Tone words adjust the score as a secondary signal. Examples include bullish words like `wins`, `strong`, `record`, `approved`, `upgrade`, and bearish words like `misses`, `falls`, `probe`, `penalty`, `downgrade`, `resigns`.
+4. Magnitude increases conviction when extractable from the headline, such as `Rs 500 crore`, `1200 cr`, `USD 200 million`, or `5 billion`. Larger amounts add a larger boost in the event direction.
+
+Recency decay is intentionally not part of headline-level scoring. Apply recency later when aggregating multiple headlines per stock.
+
+Persisted scoring fields:
+
+| Column | Meaning |
+| --- | --- |
+| `sentiment_score` | Intrinsic market impact score from `-1.0` to `+1.0`. |
+| `sentiment_method` | Always `impact_v1` for locally scored headlines. |
+| `event_type` | Optional rule classification, such as `ORDER_WIN` or `REGULATORY_ACTION`. |
 
 Manual trigger:
 
@@ -111,7 +136,7 @@ Verify directly in PostgreSQL:
 SELECT COUNT(*) AS rows, COUNT(DISTINCT symbol) AS symbols, MAX(fetch_time) AS latest_fetch
 FROM market_news_archive;
 
-SELECT symbol, headline, fetch_time, sentiment_score
+SELECT symbol, headline, fetch_time, sentiment_score, sentiment_method, event_type
 FROM market_news_archive
 ORDER BY fetch_time DESC
 LIMIT 10;

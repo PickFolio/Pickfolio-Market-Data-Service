@@ -36,6 +36,7 @@ from app.config import (
 )
 from app.db import run_migrations
 from app.history_update import run_incremental_stock_history_update, seconds_until_next_history_run
+from app.news_impact import score_market_impact
 
 # Configure logging
 logging.basicConfig(
@@ -62,6 +63,10 @@ class CatalystResponse(BaseModel):
     symbol: str
     headline: str
     sentiment_score: float
+    sentiment_method: Optional[str] = None
+    event_type: Optional[str] = None
+    fetch_time: Optional[str] = None
+    published_at: Optional[str] = None
     volume: float = 0.0
     pChange: float = 0.0
 
@@ -105,7 +110,9 @@ class Catalyst(BaseModel):
     source: str = "yfinance"
     published_at: Optional[str] = None
     url: Optional[str] = None
-    sentiment_score: float = 0.0
+    sentiment_score: Optional[float] = None
+    sentiment_method: Optional[str] = None
+    event_type: Optional[str] = None
     volume: float = 0.0
     pChange: float = 0.0
     raw_payload: Dict[str, Any] = Field(default_factory=dict)
@@ -125,7 +132,6 @@ NEWS_OVERNIGHT_DELAY_MIN = float(os.environ.get("NEWS_OVERNIGHT_DELAY_MIN", "1.5
 NEWS_OVERNIGHT_DELAY_MAX = float(os.environ.get("NEWS_OVERNIGHT_DELAY_MAX", "2.5"))
 NEWS_TOP_CATALYSTS_LIMIT = int(os.environ.get("NEWS_TOP_CATALYSTS_LIMIT", "10"))
 NEWS_REACTIVE_FETCH_CONCURRENCY = int(os.environ.get("NEWS_REACTIVE_FETCH_CONCURRENCY", "2"))
-NEWS_SENTIMENT_ENABLED = os.environ.get("NEWS_SENTIMENT_ENABLED", "false").lower() == "true"
 NEWS_INTRADAY_FULL_SCAN_ENABLED = os.environ.get("NEWS_INTRADAY_FULL_SCAN_ENABLED", "false").lower() == "true"
 
 last_known_prices: Dict[str, float] = {}
@@ -494,6 +500,8 @@ def archive_catalysts_to_db(catalysts: List[Catalyst]):
                     published_at=published_at,
                     url=catalyst.url,
                     sentiment_score=catalyst.sentiment_score,
+                    sentiment_method=catalyst.sentiment_method,
+                    event_type=catalyst.event_type,
                     volume=int(catalyst.volume or 0),
                     p_change=catalyst.pChange,
                     raw_payload=catalyst.raw_payload,
@@ -593,6 +601,24 @@ def fetch_news_for_symbol(symbol: str) -> Optional[Catalyst]:
         logger.exception("Failed to fetch news for %s: %s", symbol, exc)
     return None
 
+
+async def score_headline_sentiment(
+    headline: str,
+) -> tuple[Optional[float], Optional[str], Optional[str]]:
+    impact = score_market_impact(headline)
+    return impact.score, impact.method, impact.event_type
+
+
+def apply_headline_impact_score(catalyst: Catalyst) -> Catalyst:
+    impact = score_market_impact(catalyst.headline)
+    return catalyst.model_copy(
+        update={
+            "sentiment_score": impact.score,
+            "sentiment_method": impact.method,
+            "event_type": impact.event_type,
+        }
+    )
+
 top_positive_catalysts: List[CatalystResponse] = []
 top_negative_catalysts: List[CatalystResponse] = []
 fetch_semaphore = asyncio.Semaphore(NEWS_REACTIVE_FETCH_CONCURRENCY)
@@ -645,19 +671,7 @@ async def _process_catalysts_batch_locked(universe: List[str], is_intraday: bool
         return result
 
     logger.info(f"Starting news batch processing for {len(universe)} symbols (Intraday: {is_intraday})...")
-    sentiment_pipeline = None
-    if NEWS_SENTIMENT_ENABLED:
-        logger.info("Loading FinBERT model into RAM...")
-        try:
-            from transformers import pipeline
-            def load_pipeline():
-                return pipeline("sentiment-analysis", model="ProsusAI/finbert")
-            sentiment_pipeline = await run_bg(load_pipeline)
-        except Exception as e:
-            logger.error(f"Failed to load FinBERT: {e}")
-            sentiment_pipeline = None
-    else:
-        logger.info("News sentiment scoring is disabled; ingesting headlines without FinBERT.")
+    logger.info("Using local headline market impact scorer: impact_v1.")
 
     new_catalysts = []
     positive_scored = []
@@ -666,33 +680,35 @@ async def _process_catalysts_batch_locked(universe: List[str], is_intraday: bool
     for symbol in universe:
         catalyst = await run_bg(fetch_news_for_symbol, symbol)
         if catalyst:
-            sentiment_score = 0.0
-            if sentiment_pipeline and catalyst.headline:
-                try:
-                    result_list = await run_bg(sentiment_pipeline, catalyst.headline)
-                    model_result = result_list[0]
-                    if model_result['label'] == 'positive':
-                        sentiment_score = model_result['score']
-                    elif model_result['label'] == 'negative':
-                        sentiment_score = -model_result['score']
-                except Exception:
-                    pass
-
-            catalyst = catalyst.model_copy(update={"sentiment_score": sentiment_score})
+            sentiment_score, sentiment_method, event_type = await score_headline_sentiment(
+                catalyst.headline,
+            )
+            catalyst = catalyst.model_copy(
+                update={
+                    "sentiment_score": sentiment_score,
+                    "sentiment_method": sentiment_method,
+                    "event_type": event_type,
+                }
+            )
             new_catalysts.append(catalyst)
             cached_catalysts[symbol] = catalyst
 
+            ranking_score = sentiment_score or 0.0
             c_resp = CatalystResponse(
                 symbol=symbol, 
                 headline=catalyst.headline, 
-                sentiment_score=sentiment_score,
+                sentiment_score=ranking_score,
+                sentiment_method=sentiment_method,
+                event_type=event_type,
+                fetch_time=catalyst.fetch_time,
+                published_at=catalyst.published_at,
                 volume=catalyst.volume,
                 pChange=catalyst.pChange
             )
             
-            if sentiment_score > 0:
+            if ranking_score > 0:
                 positive_scored.append(c_resp)
-            elif sentiment_score < 0:
+            elif ranking_score < 0:
                 negative_scored.append(c_resp)
                 
         delay = (
@@ -703,9 +719,7 @@ async def _process_catalysts_batch_locked(universe: List[str], is_intraday: bool
         await asyncio.sleep(delay)
         
     logger.info(f"Batch complete. Evaluated {len(new_catalysts)} headlines. Found {len(positive_scored)} positive and {len(negative_scored)} negative catalysts.")
-    logger.info("Unloading FinBERT model from RAM...")
-    if sentiment_pipeline:
-        del sentiment_pipeline
+    logger.info("Headline impact scoring complete.")
     gc.collect()
         
     positive_scored.sort(key=lambda x: (x.sentiment_score, abs(x.pChange), x.volume), reverse=True)
@@ -843,6 +857,7 @@ async def get_catalysts(request: CatalystsRequest):
                 catalyst = await run_bg(fetch_news_for_symbol, symbol)
                 await asyncio.sleep(0.5) # Rate limit intra-fetch
                 if catalyst:
+                    catalyst = apply_headline_impact_score(catalyst)
                     cached_catalysts[symbol] = catalyst
                     results.append(catalyst)
                     await run_bg(archive_catalysts_to_db, [catalyst])
