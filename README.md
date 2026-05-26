@@ -65,6 +65,8 @@ All endpoints are prefixed with `/api/market-data`.
 | **GET** | `/trending` | Gets cached top gainers and losers. |
 | **POST** | `/catalysts` | Gets cached or freshly fetched stock catalysts. |
 | **GET** | `/catalysts/top` | Gets top positive and negative catalysts. |
+| **GET** | `/news/status` | Gets archive counts and latest news ingestion state. |
+| **POST** | `/news/update` | Manually starts news ingestion from `stock_master`. |
 | **GET** | `/health` | Health check. |
 
 ### WebSocket Endpoint (for internal services):
@@ -81,6 +83,39 @@ The service owns two long-lived PostgreSQL tables in `pickfolio_market_data`:
 * `stock_price_history`: one row per symbol per trading day, with OHLCV candles and a unique constraint on `(symbol, trading_date)`.
 
 Rows are not deleted automatically. If a stock leaves the core universe, update `stock_master.is_in_core_universe` to `false` but keep metadata and price history. Any stock discovered through future lazy loading should be inserted into `stock_master`, initialized with 1Y history, and then included in future incremental syncs.
+
+## News Ingestion
+
+News ingestion uses `stock_master` as its source of symbols. It runs daily at 07:00 IST by default, does not call NSE for the NIFTY Total Market, and does not fall back to hardcoded symbols. If `stock_master` is empty, the ingestion run records an empty universe instead of fetching unrelated symbols.
+
+Full-universe intraday scanning is disabled by default because it competes with market movers and can overload small machines. Reactive catalyst fetches remain available through `/catalysts`. FinBERT sentiment scoring is also disabled by default; headline ingestion persists raw headlines first, and sentiment can be enabled later with `NEWS_SENTIMENT_ENABLED=true` or moved to a separate offline signal worker.
+
+Successful yfinance news fetches are persisted to `market_news_archive`. This includes both scheduled batch ingestion and reactive `/catalysts` requests.
+
+Manual trigger:
+
+```bash
+curl -X POST http://localhost:8082/api/market-data/news/update
+curl -X POST "http://localhost:8082/api/market-data/news/update?limit=10"
+```
+
+Check status:
+
+```bash
+curl http://localhost:8082/api/market-data/news/status
+```
+
+Verify directly in PostgreSQL:
+
+```sql
+SELECT COUNT(*) AS rows, COUNT(DISTINCT symbol) AS symbols, MAX(fetch_time) AS latest_fetch
+FROM market_news_archive;
+
+SELECT symbol, headline, fetch_time, sentiment_score
+FROM market_news_archive
+ORDER BY fetch_time DESC
+LIMIT 10;
+```
 
 Schema migrations live in `migrations/` and are applied by the market-data service at startup and by bootstrap scripts before they write data.
 
@@ -144,6 +179,36 @@ docker compose up -d --no-deps market-data-service
 
 The script is safe to rerun. It uses PostgreSQL upserts for both metadata and candles, so interrupted runs continue without wiping data or creating duplicate `(symbol, trading_date)` rows.
 
+## Incremental Daily History Updates
+
+After bootstrap completes, the service refreshes recent daily candles for the active core universe every day at 03:00 IST by default. Startup catch-up is disabled by default so top gainers and losers can continue using the prior close for the rest of the market day after close. The updater fetches a short recent yfinance daily window and upserts into `stock_price_history`, so it is safe to rerun manually when needed.
+
+Manual trigger through the running API:
+
+```bash
+curl -X POST http://localhost:8082/api/market-data/history/update
+curl http://localhost:8082/api/market-data/history/status
+```
+
+Manual trigger through Docker Compose:
+
+```bash
+docker compose run --rm market-data-service python scripts/update_stock_history.py
+```
+
+Verify latest stored candles directly in PostgreSQL:
+
+```sql
+SELECT COUNT(*) AS rows, MAX(trading_date) AS latest, MIN(trading_date) AS oldest
+FROM stock_price_history;
+
+SELECT trading_date, COUNT(*)
+FROM stock_price_history
+GROUP BY trading_date
+ORDER BY trading_date DESC
+LIMIT 10;
+```
+
 ## Bootstrap Environment Variables
 
 | Variable | Default | Purpose |
@@ -159,3 +224,10 @@ The script is safe to rerun. It uses PostgreSQL upserts for both metadata and ca
 | `STOCK_BOOTSTRAP_ON_STARTUP` | `true` | Automatically run bootstrap in the background until the completion marker exists. |
 | `STOCK_BOOTSTRAP_HISTORY_DELAY_SEC` | `1.0` | Delay between yfinance history calls during automatic bootstrap. |
 | `STOCK_BOOTSTRAP_STARTUP_LIMIT` | unset | Optional max number of stocks for automatic bootstrap smoke tests. |
+| `STOCK_HISTORY_INCREMENTAL_ON_STARTUP` | `false` | Run an incremental history catch-up when the service starts. Keep disabled to avoid refreshing closes immediately after a restart. |
+| `STOCK_HISTORY_INCREMENTAL_SCHEDULER_ENABLED` | `true` | Enable the daily incremental history scheduler. |
+| `STOCK_HISTORY_INCREMENTAL_RUN_HOUR_IST` | `3` | Daily scheduler hour in IST. |
+| `STOCK_HISTORY_INCREMENTAL_RUN_MINUTE_IST` | `0` | Daily scheduler minute in IST. |
+| `STOCK_HISTORY_INCREMENTAL_DELAY_SEC` | `0.5` | Delay between yfinance calls during incremental updates. |
+| `STOCK_HISTORY_INCREMENTAL_LOOKBACK_DAYS` | `10` | Controls the recent yfinance period: `<=5` uses `5d`, otherwise `1mo`. |
+| `STOCK_HISTORY_INCREMENTAL_STARTUP_LIMIT` | unset | Optional max symbols for startup catch-up smoke tests. |

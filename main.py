@@ -2,15 +2,14 @@ import asyncio
 import httpx
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from typing import Dict, List, Set, Optional
-from pydantic import BaseModel
+from typing import Any, Dict, List, Set, Optional
+from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import pytz
 import json
 import logging
 import os
-import psycopg
 import random
 import gc
 import concurrent.futures
@@ -22,14 +21,21 @@ async def run_bg(func, *args):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(bg_executor, func, *args)
 
-from psycopg.types.json import Jsonb
 from app.bootstrap import run_stock_history_bootstrap_if_needed
 from app.config import (
+    STOCK_HISTORY_INCREMENTAL_DELAY_SEC,
+    STOCK_HISTORY_INCREMENTAL_LOOKBACK_DAYS,
+    STOCK_HISTORY_INCREMENTAL_ON_STARTUP,
+    STOCK_HISTORY_INCREMENTAL_RUN_HOUR_IST,
+    STOCK_HISTORY_INCREMENTAL_RUN_MINUTE_IST,
+    STOCK_HISTORY_INCREMENTAL_SCHEDULER_ENABLED,
+    STOCK_HISTORY_INCREMENTAL_STARTUP_LIMIT,
     STOCK_BOOTSTRAP_HISTORY_DELAY_SEC,
     STOCK_BOOTSTRAP_ON_STARTUP,
     STOCK_BOOTSTRAP_STARTUP_LIMIT,
 )
 from app.db import run_migrations
+from app.history_update import run_incremental_stock_history_update, seconds_until_next_history_run
 
 # Configure logging
 logging.basicConfig(
@@ -96,8 +102,13 @@ class Catalyst(BaseModel):
     symbol: str
     headline: str
     fetch_time: str
+    source: str = "yfinance"
+    published_at: Optional[str] = None
+    url: Optional[str] = None
+    sentiment_score: float = 0.0
     volume: float = 0.0
     pChange: float = 0.0
+    raw_payload: Dict[str, Any] = Field(default_factory=dict)
 
 
 # --- Global State & Configuration ---
@@ -114,12 +125,8 @@ NEWS_OVERNIGHT_DELAY_MIN = float(os.environ.get("NEWS_OVERNIGHT_DELAY_MIN", "1.5
 NEWS_OVERNIGHT_DELAY_MAX = float(os.environ.get("NEWS_OVERNIGHT_DELAY_MAX", "2.5"))
 NEWS_TOP_CATALYSTS_LIMIT = int(os.environ.get("NEWS_TOP_CATALYSTS_LIMIT", "10"))
 NEWS_REACTIVE_FETCH_CONCURRENCY = int(os.environ.get("NEWS_REACTIVE_FETCH_CONCURRENCY", "2"))
-
-NSE_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-}
+NEWS_SENTIMENT_ENABLED = os.environ.get("NEWS_SENTIMENT_ENABLED", "false").lower() == "true"
+NEWS_INTRADAY_FULL_SCAN_ENABLED = os.environ.get("NEWS_INTRADAY_FULL_SCAN_ENABLED", "false").lower() == "true"
 
 last_known_prices: Dict[str, float] = {}
 cached_pulse_data: List[PulseResponse] = [
@@ -128,6 +135,10 @@ cached_pulse_data: List[PulseResponse] = [
     PulseResponse(symbol="IT", move="0.00%", tone="var(--text-secondary)", sparkline=[]),
 ]
 cached_market_movers: MarketMoversResponse = MarketMoversResponse(gainers=[], losers=[])
+history_update_task: asyncio.Task | None = None
+latest_history_update_result: dict | None = None
+news_ingestion_task: asyncio.Task | None = None
+latest_news_ingestion_result: dict | None = None
 
 # --- Connection Manager ---
 class ConnectionManager:
@@ -229,6 +240,89 @@ def fetch_pulse_blocking() -> List[PulseResponse]:
 # (fetch_market_movers_blocking removed to make it non-blocking async)
 
 # --- Background Tasks ---
+def _optional_int(value: str | None) -> int | None:
+    return int(value) if value else None
+
+
+async def _history_update_runner(limit: int | None = None):
+    global latest_history_update_result
+    try:
+        latest_history_update_result = await run_bg(
+            run_incremental_stock_history_update,
+            limit,
+            STOCK_HISTORY_INCREMENTAL_DELAY_SEC,
+            STOCK_HISTORY_INCREMENTAL_LOOKBACK_DAYS,
+        )
+    except Exception as exc:
+        logger.exception("Incremental stock history update task failed: %s", exc)
+        latest_history_update_result = {
+            "status": "failed",
+            "error": str(exc),
+            "completed_at": datetime.now(pytz.UTC).isoformat(),
+        }
+
+
+def start_history_update_task(limit: int | None = None) -> bool:
+    global history_update_task
+    if history_update_task and not history_update_task.done():
+        return False
+    history_update_task = asyncio.create_task(_history_update_runner(limit=limit))
+    return True
+
+
+async def stock_history_incremental_scheduler_loop():
+    startup_limit = _optional_int(STOCK_HISTORY_INCREMENTAL_STARTUP_LIMIT)
+    if STOCK_HISTORY_INCREMENTAL_ON_STARTUP:
+        logger.info("Starting incremental stock history catch-up on startup.")
+        start_history_update_task(limit=startup_limit)
+
+    if not STOCK_HISTORY_INCREMENTAL_SCHEDULER_ENABLED:
+        logger.info("Incremental stock history scheduler is disabled.")
+        return
+
+    while True:
+        wait_seconds = seconds_until_next_history_run(
+            STOCK_HISTORY_INCREMENTAL_RUN_HOUR_IST,
+            STOCK_HISTORY_INCREMENTAL_RUN_MINUTE_IST,
+        )
+        logger.info(
+            "Sleeping %.0f seconds until next stock history update at %02d:%02d IST.",
+            wait_seconds,
+            STOCK_HISTORY_INCREMENTAL_RUN_HOUR_IST,
+            STOCK_HISTORY_INCREMENTAL_RUN_MINUTE_IST,
+        )
+        await asyncio.sleep(wait_seconds)
+        started = start_history_update_task()
+        if started and history_update_task:
+            await history_update_task
+        else:
+            logger.warning("Skipping scheduled stock history update because one is already running.")
+
+
+async def _news_ingestion_runner(limit: int | None = None, is_intraday: bool = False):
+    global latest_news_ingestion_result
+    try:
+        from app.repositories import get_news_universe_symbols
+
+        universe = await run_bg(get_news_universe_symbols, limit)
+        latest_news_ingestion_result = await process_catalysts_batch(universe, is_intraday=is_intraday)
+    except Exception as exc:
+        logger.exception("News ingestion task failed: %s", exc)
+        latest_news_ingestion_result = {
+            "status": "failed",
+            "error": str(exc),
+            "completed_at": datetime.now(pytz.UTC).isoformat(),
+        }
+
+
+def start_news_ingestion_task(limit: int | None = None, is_intraday: bool = False) -> bool:
+    global news_ingestion_task
+    if news_ingestion_task and not news_ingestion_task.done():
+        return False
+    news_ingestion_task = asyncio.create_task(_news_ingestion_runner(limit=limit, is_intraday=is_intraday))
+    return True
+
+
 async def broadcast_prices_loop():
     global last_known_prices
     await asyncio.sleep(15)
@@ -374,42 +468,110 @@ cached_catalysts: Dict[str, Catalyst] = {}
 PREMARKET_CACHE_FILE = "premarket_news_cache.json"
 
 def init_db():
-    if not DATABASE_URL: return
+    if not DATABASE_URL:
+        return
     try:
-        with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS market_news_archive (
-                        id SERIAL PRIMARY KEY,
-                        symbol TEXT NOT NULL,
-                        headline TEXT NOT NULL,
-                        fetch_time TIMESTAMPTZ NOT NULL,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                    )
-                """)
-            conn.commit()
+        run_migrations()
     except Exception as e:
-        logger.error(f"Failed to initialize DB: {e}")
+        logger.exception("Failed to initialize market news archive: %s", e)
 
 def archive_catalysts_to_db(catalysts: List[Catalyst]):
-    if not DATABASE_URL or not catalysts: return
+    if not DATABASE_URL or not catalysts:
+        return 0
     try:
-        with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.executemany("""
-                    INSERT INTO market_news_archive (symbol, headline, fetch_time)
-                    VALUES (%s, %s, %s)
-                """, [(c.symbol, c.headline, c.fetch_time) for c in catalysts])
-            conn.commit()
-    except Exception:
-        pass
+        from app.repositories import NewsHeadline, archive_news_headlines
+
+        rows = []
+        for catalyst in catalysts:
+            fetch_time = datetime.fromisoformat(catalyst.fetch_time)
+            published_at = datetime.fromisoformat(catalyst.published_at) if catalyst.published_at else None
+            rows.append(
+                NewsHeadline(
+                    symbol=catalyst.symbol,
+                    headline=catalyst.headline,
+                    fetch_time=fetch_time,
+                    source=catalyst.source,
+                    published_at=published_at,
+                    url=catalyst.url,
+                    sentiment_score=catalyst.sentiment_score,
+                    volume=int(catalyst.volume or 0),
+                    p_change=catalyst.pChange,
+                    raw_payload=catalyst.raw_payload,
+                )
+            )
+        inserted = archive_news_headlines(rows)
+        logger.info("Archived %s market news headlines.", inserted)
+        return inserted
+    except Exception as exc:
+        logger.exception("Failed to archive %s market news headlines: %s", len(catalysts), exc)
+        return 0
+
+
+def _coerce_news_item(item: Any) -> dict:
+    if not isinstance(item, dict):
+        return {}
+    content = item.get("content")
+    if isinstance(content, dict):
+        return {**item, **content}
+    return item
+
+
+def _news_value(item: dict, *keys: str):
+    current = item
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _extract_headline(item: dict) -> str:
+    title = item.get("title") or _news_value(item, "content", "title")
+    if isinstance(title, dict):
+        title = title.get("raw") or title.get("text")
+    return str(title or "").strip()
+
+
+def _extract_url(item: dict) -> str | None:
+    url = item.get("link") or item.get("url") or _news_value(item, "canonicalUrl", "url")
+    return str(url).strip() if url else None
+
+
+def _extract_published_at(item: dict) -> str | None:
+    raw_time = item.get("providerPublishTime") or item.get("pubDate") or item.get("displayTime")
+    if isinstance(raw_time, (int, float)):
+        return datetime.fromtimestamp(raw_time, tz=pytz.UTC).isoformat()
+    if isinstance(raw_time, str):
+        try:
+            return datetime.fromisoformat(raw_time.replace("Z", "+00:00")).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def _json_safe(value: Any):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return str(value)
 
 def fetch_news_for_symbol(symbol: str) -> Optional[Catalyst]:
     try:
         ticker = yf.Ticker(symbol)
         news = ticker.news
-        if news and len(news) > 0:
-            headline = news[0].get("title", "")
+        if not news:
+            logger.info("No yfinance news returned for %s.", symbol)
+            return None
+
+        for raw_item in news:
+            item = _coerce_news_item(raw_item)
+            headline = _extract_headline(item)
+            if not headline:
+                continue
+
             fast_info = ticker.fast_info
             volume = float(fast_info.last_volume) if hasattr(fast_info, 'last_volume') and fast_info.last_volume else 0.0
             last_price = float(fast_info.last_price) if hasattr(fast_info, 'last_price') and fast_info.last_price else 0.0
@@ -420,50 +582,82 @@ def fetch_news_for_symbol(symbol: str) -> Optional[Catalyst]:
                 symbol=symbol,
                 headline=headline,
                 fetch_time=datetime.now(pytz.UTC).isoformat(),
+                published_at=_extract_published_at(item),
+                url=_extract_url(item),
                 volume=volume,
-                pChange=pChange
+                pChange=pChange,
+                raw_payload=_json_safe(item),
             )
-    except Exception:
-        pass
+        logger.info("No usable yfinance headline found for %s.", symbol)
+    except Exception as exc:
+        logger.exception("Failed to fetch news for %s: %s", symbol, exc)
     return None
 
 top_positive_catalysts: List[CatalystResponse] = []
 top_negative_catalysts: List[CatalystResponse] = []
 fetch_semaphore = asyncio.Semaphore(NEWS_REACTIVE_FETCH_CONCURRENCY)
+news_ingestion_lock = asyncio.Lock()
 
 def fetch_universe_symbols() -> List[str]:
-    fallback_symbols = [
-        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
-        "SBI.NS", "BHARTIARTL.NS", "ITC.NS", "HINDUNILVR.NS", "LT.NS"
-    ]
     try:
-        with httpx.Client(timeout=10.0, headers=NSE_HEADERS) as client:
-            client.get('https://www.nseindia.com', timeout=10.0)
-            res = client.get('https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%20TOTAL%20MARKET', timeout=10.0)
-            if res.status_code == 200:
-                data = res.json().get('data', [])
-                symbols = [d['symbol'] + '.NS' for d in data if d.get('symbol') and d.get('symbol') != 'NIFTY TOTAL MARKET']
-                if symbols: return symbols
-            else:
-                logger.error(f"NSE API Error for Universe: Status {res.status_code}")
+        from app.repositories import get_news_universe_symbols
+
+        symbols = get_news_universe_symbols()
+        logger.info("Loaded %s news universe symbols from stock_master.", len(symbols))
+        return symbols
     except Exception as e:
-        logger.error(f"Failed to fetch dynamic universe: {e}")
-    return fallback_symbols
+        logger.exception("Failed to load news universe from stock_master: %s", e)
+    return []
 
 async def process_catalysts_batch(universe: List[str], is_intraday: bool = False):
     global top_positive_catalysts
     global top_negative_catalysts
-    
+
+    if news_ingestion_lock.locked():
+        logger.warning("Skipping news batch because another news ingestion job is already running.")
+        return {
+            "status": "skipped",
+            "reason": "news_ingestion_already_running",
+            "completed_at": datetime.now(pytz.UTC).isoformat(),
+            "universe_size": len(universe),
+        }
+
+    async with news_ingestion_lock:
+        return await _process_catalysts_batch_locked(universe, is_intraday=is_intraday)
+
+
+async def _process_catalysts_batch_locked(universe: List[str], is_intraday: bool = False):
+    global top_positive_catalysts
+    global top_negative_catalysts
+     
+    result = {
+        "started_at": datetime.now(pytz.UTC).isoformat(),
+        "completed_at": None,
+        "universe_size": len(universe),
+        "headlines_found": 0,
+        "headlines_archived": 0,
+        "positive": 0,
+        "negative": 0,
+    }
+    if not universe:
+        logger.warning("Skipping news batch because stock_master returned no symbols.")
+        result["completed_at"] = datetime.now(pytz.UTC).isoformat()
+        return result
+
     logger.info(f"Starting news batch processing for {len(universe)} symbols (Intraday: {is_intraday})...")
-    logger.info("Loading FinBERT model into RAM...")
-    try:
-        from transformers import pipeline
-        def load_pipeline():
-            return pipeline("sentiment-analysis", model="ProsusAI/finbert")
-        sentiment_pipeline = await run_bg(load_pipeline)
-    except Exception as e:
-        logger.error(f"Failed to load FinBERT: {e}")
-        sentiment_pipeline = None
+    sentiment_pipeline = None
+    if NEWS_SENTIMENT_ENABLED:
+        logger.info("Loading FinBERT model into RAM...")
+        try:
+            from transformers import pipeline
+            def load_pipeline():
+                return pipeline("sentiment-analysis", model="ProsusAI/finbert")
+            sentiment_pipeline = await run_bg(load_pipeline)
+        except Exception as e:
+            logger.error(f"Failed to load FinBERT: {e}")
+            sentiment_pipeline = None
+    else:
+        logger.info("News sentiment scoring is disabled; ingesting headlines without FinBERT.")
 
     new_catalysts = []
     positive_scored = []
@@ -472,20 +666,21 @@ async def process_catalysts_batch(universe: List[str], is_intraday: bool = False
     for symbol in universe:
         catalyst = await run_bg(fetch_news_for_symbol, symbol)
         if catalyst:
-            new_catalysts.append(catalyst)
-            cached_catalysts[symbol] = catalyst
-            
             sentiment_score = 0.0
             if sentiment_pipeline and catalyst.headline:
                 try:
                     result_list = await run_bg(sentiment_pipeline, catalyst.headline)
-                    result = result_list[0]
-                    if result['label'] == 'positive':
-                        sentiment_score = result['score']
-                    elif result['label'] == 'negative':
-                        sentiment_score = -result['score']
+                    model_result = result_list[0]
+                    if model_result['label'] == 'positive':
+                        sentiment_score = model_result['score']
+                    elif model_result['label'] == 'negative':
+                        sentiment_score = -model_result['score']
                 except Exception:
                     pass
+
+            catalyst = catalyst.model_copy(update={"sentiment_score": sentiment_score})
+            new_catalysts.append(catalyst)
+            cached_catalysts[symbol] = catalyst
 
             c_resp = CatalystResponse(
                 symbol=symbol, 
@@ -500,8 +695,11 @@ async def process_catalysts_batch(universe: List[str], is_intraday: bool = False
             elif sentiment_score < 0:
                 negative_scored.append(c_resp)
                 
-        # Faster pacing for intraday (1.0-1.5s) vs overnight (1.5-2.5s)
-        delay = random.uniform(1.0, 1.5) if is_intraday else random.uniform(1.5, 2.5)
+        delay = (
+            random.uniform(NEWS_INTRADAY_DELAY_MIN, NEWS_INTRADAY_DELAY_MAX)
+            if is_intraday
+            else random.uniform(NEWS_OVERNIGHT_DELAY_MIN, NEWS_OVERNIGHT_DELAY_MAX)
+        )
         await asyncio.sleep(delay)
         
     logger.info(f"Batch complete. Evaluated {len(new_catalysts)} headlines. Found {len(positive_scored)} positive and {len(negative_scored)} negative catalysts.")
@@ -513,8 +711,8 @@ async def process_catalysts_batch(universe: List[str], is_intraday: bool = False
     positive_scored.sort(key=lambda x: (x.sentiment_score, abs(x.pChange), x.volume), reverse=True)
     negative_scored.sort(key=lambda x: (x.sentiment_score, abs(x.pChange), x.volume))
     
-    top_positive_catalysts = positive_scored[:10]
-    top_negative_catalysts = negative_scored[:10]
+    top_positive_catalysts = positive_scored[:NEWS_TOP_CATALYSTS_LIMIT]
+    top_negative_catalysts = negative_scored[:NEWS_TOP_CATALYSTS_LIMIT]
     
     try:
         with open(PREMARKET_CACHE_FILE, "w") as f:
@@ -522,10 +720,17 @@ async def process_catalysts_batch(universe: List[str], is_intraday: bool = False
     except Exception:
         pass
         
-    await run_bg(archive_catalysts_to_db, new_catalysts)
+    archived = await run_bg(archive_catalysts_to_db, new_catalysts)
+    result["completed_at"] = datetime.now(pytz.UTC).isoformat()
+    result["headlines_found"] = len(new_catalysts)
+    result["headlines_archived"] = archived or 0
+    result["positive"] = len(positive_scored)
+    result["negative"] = len(negative_scored)
+    return result
 
 
 async def update_premarket_news_loop():
+    global latest_news_ingestion_result
     logger.info("Starting Pre-Market News Primer loop...")
     await run_bg(init_db)
     
@@ -541,30 +746,32 @@ async def update_premarket_news_loop():
     
     while True:
         now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
-        target_time = now_ist.replace(hour=8, minute=15, second=0, microsecond=0)
+        target_time = now_ist.replace(hour=7, minute=0, second=0, microsecond=0)
         if now_ist >= target_time:
             target_time += timedelta(days=1)
             
         wait_seconds = (target_time - now_ist).total_seconds()
-        logger.info(f"Sleeping for {wait_seconds} seconds until next Pre-Market Primer at 08:15 AM IST.")
+        logger.info(f"Sleeping for {wait_seconds} seconds until next Pre-Market Primer at 07:00 AM IST.")
         await asyncio.sleep(wait_seconds)
         
         logger.info("Waking up: Initiating Pre-Market News Primer...")
         universe = await run_bg(fetch_universe_symbols)
-        await process_catalysts_batch(universe, is_intraday=False)
+        latest_news_ingestion_result = await process_catalysts_batch(universe, is_intraday=False)
 
 
 async def intraday_news_scanner_loop():
+    global latest_news_ingestion_result
     logger.info("Starting Intraday Breaking News Scanner loop...")
     await asyncio.sleep(60) # Offset start
     
     while True:
-        if is_market_open_india():
+        if is_market_open_india() and NEWS_INTRADAY_FULL_SCAN_ENABLED:
             logger.info("Market is open. Initiating Intraday News Scanner for full universe...")
             universe = await run_bg(fetch_universe_symbols)
-            # Process full universe, use faster pacing
-            await process_catalysts_batch(universe, is_intraday=True)
-        await asyncio.sleep(1800) # Run every 30 minutes during market hours
+            latest_news_ingestion_result = await process_catalysts_batch(universe, is_intraday=True)
+        elif is_market_open_india():
+            logger.info("Market is open; full-universe intraday news scan is disabled. Reactive catalyst fetch remains available.")
+        await asyncio.sleep(NEWS_INTRADAY_INTERVAL_SEC)
 
 
 @asynccontextmanager
@@ -591,6 +798,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(broadcast_prices_loop())
     asyncio.create_task(update_pulse_cache_loop())
     asyncio.create_task(update_market_movers_cache_loop())
+    if STOCK_HISTORY_INCREMENTAL_ON_STARTUP or STOCK_HISTORY_INCREMENTAL_SCHEDULER_ENABLED:
+        asyncio.create_task(stock_history_incremental_scheduler_loop())
     asyncio.create_task(update_premarket_news_loop())
     asyncio.create_task(intraday_news_scanner_loop())
     yield
@@ -636,6 +845,7 @@ async def get_catalysts(request: CatalystsRequest):
                 if catalyst:
                     cached_catalysts[symbol] = catalyst
                     results.append(catalyst)
+                    await run_bg(archive_catalysts_to_db, [catalyst])
                     try:
                         with open(PREMARKET_CACHE_FILE, "w") as f:
                             json.dump({k: v.model_dump() for k, v in cached_catalysts.items()}, f)
@@ -646,6 +856,51 @@ async def get_catalysts(request: CatalystsRequest):
 @app.get("/api/market-data/health")
 async def health_check():
     return {"status": "ok", "cache_ready": len(cached_pulse_data) > 0}
+
+@app.get("/api/market-data/news/status")
+async def get_news_ingestion_status():
+    from app.repositories import get_market_news_archive_summary, get_news_universe_symbols
+
+    summary = await run_bg(get_market_news_archive_summary)
+    universe_size = len(await run_bg(get_news_universe_symbols, None))
+    return {
+        **summary,
+        "universe_source": "stock_master",
+        "universe_size": universe_size,
+        "ingestion_running": bool(news_ingestion_task and not news_ingestion_task.done()),
+        "last_ingestion": latest_news_ingestion_result,
+    }
+
+@app.post("/api/market-data/news/update")
+async def trigger_news_ingestion(limit: Optional[int] = None, intraday: bool = False):
+    started = start_news_ingestion_task(limit=limit, is_intraday=intraday)
+    if not started:
+        return {
+            "status": "already_running",
+            "last_ingestion": latest_news_ingestion_result,
+        }
+    return {"status": "started", "limit": limit, "intraday": intraday, "universe_source": "stock_master"}
+
+@app.get("/api/market-data/history/status")
+async def get_history_update_status():
+    from app.repositories import get_price_history_summary
+
+    summary = await run_bg(get_price_history_summary)
+    return {
+        **summary,
+        "update_running": bool(history_update_task and not history_update_task.done()),
+        "last_update": latest_history_update_result,
+    }
+
+@app.post("/api/market-data/history/update")
+async def trigger_history_update(limit: Optional[int] = None):
+    started = start_history_update_task(limit=limit)
+    if not started:
+        return {
+            "status": "already_running",
+            "last_update": latest_history_update_result,
+        }
+    return {"status": "started", "limit": limit}
 
 @app.get("/api/market-data/pulse", response_model=List[PulseResponse])
 async def get_market_pulse():

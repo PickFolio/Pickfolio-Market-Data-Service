@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Iterable
 
@@ -35,6 +35,20 @@ class PriceCandle:
     low: Decimal
     close: Decimal
     volume: int
+
+
+@dataclass(frozen=True)
+class NewsHeadline:
+    symbol: str
+    headline: str
+    fetch_time: datetime
+    source: str = "yfinance"
+    published_at: datetime | None = None
+    url: str | None = None
+    sentiment_score: float | None = None
+    volume: int = 0
+    p_change: float = 0.0
+    raw_payload: dict[str, Any] | None = None
 
 
 def upsert_stock_master(stock: StockMetadata) -> None:
@@ -159,6 +173,43 @@ def get_tracked_symbols() -> list[str]:
             return [row[0] for row in cur.fetchall()]
 
 
+def get_core_universe_symbols_with_latest_history() -> list[tuple[str, date | None]]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(sm.yahoo_symbol, sm.symbol),
+                    MAX(sph.trading_date)
+                FROM stock_master sm
+                LEFT JOIN stock_price_history sph
+                    ON sph.symbol = COALESCE(sm.yahoo_symbol, sm.symbol)
+                WHERE sm.is_in_core_universe = TRUE
+                  AND sm.is_active = TRUE
+                GROUP BY COALESCE(sm.yahoo_symbol, sm.symbol)
+                ORDER BY COALESCE(sm.yahoo_symbol, sm.symbol)
+                """
+            )
+            return [(row[0], row[1]) for row in cur.fetchall()]
+
+
+def get_news_universe_symbols(limit: int | None = None) -> list[str]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            query = """
+                SELECT DISTINCT COALESCE(NULLIF(yahoo_symbol, ''), symbol)
+                FROM stock_master
+                WHERE is_active = TRUE
+                ORDER BY COALESCE(NULLIF(yahoo_symbol, ''), symbol)
+            """
+            params: tuple[Any, ...] = ()
+            if limit is not None:
+                query += " LIMIT %s"
+                params = (limit,)
+            cur.execute(query, params)
+            return [row[0] for row in cur.fetchall()]
+
+
 def get_symbols_missing_history() -> set[str]:
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -178,6 +229,124 @@ def count_price_history_rows() -> int:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM stock_price_history")
             return int(cur.fetchone()[0])
+
+
+def get_price_history_summary() -> dict:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    MIN(trading_date),
+                    MAX(trading_date),
+                    COUNT(DISTINCT symbol)
+                FROM stock_price_history
+                """
+            )
+            row = cur.fetchone()
+            return {
+                "rows": int(row[0] or 0),
+                "oldest_trading_date": row[1].isoformat() if row[1] else None,
+                "latest_trading_date": row[2].isoformat() if row[2] else None,
+                "symbols": int(row[3] or 0),
+            }
+
+
+def archive_news_headlines(headlines: Iterable[NewsHeadline]) -> int:
+    rows = [row for row in headlines if row.headline and row.headline.strip()]
+    if not rows:
+        return 0
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO market_news_archive (
+                    symbol,
+                    headline,
+                    fetch_time,
+                    fetch_date,
+                    source,
+                    published_at,
+                    url,
+                    sentiment_score,
+                    volume,
+                    p_change,
+                    raw_payload
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (symbol, headline, fetch_date) WHERE btrim(headline) <> ''
+                DO UPDATE SET
+                    source = EXCLUDED.source,
+                    published_at = COALESCE(EXCLUDED.published_at, market_news_archive.published_at),
+                    url = COALESCE(EXCLUDED.url, market_news_archive.url),
+                    sentiment_score = COALESCE(EXCLUDED.sentiment_score, market_news_archive.sentiment_score),
+                    volume = EXCLUDED.volume,
+                    p_change = EXCLUDED.p_change,
+                    raw_payload = EXCLUDED.raw_payload
+                """,
+                [
+                    (
+                        row.symbol,
+                        row.headline,
+                        row.fetch_time,
+                        row.fetch_time.date(),
+                        row.source,
+                        row.published_at,
+                        row.url,
+                        row.sentiment_score,
+                        row.volume,
+                        row.p_change,
+                        Jsonb(row.raw_payload or {}),
+                    )
+                    for row in rows
+                ],
+            )
+        conn.commit()
+    return len(rows)
+
+
+def get_market_news_archive_summary() -> dict:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*),
+                    COUNT(DISTINCT symbol),
+                    MIN(fetch_time),
+                    MAX(fetch_time),
+                    MAX(published_at)
+                FROM market_news_archive
+                """
+            )
+            row = cur.fetchone()
+            cur.execute(
+                """
+                SELECT symbol, headline, fetch_time, sentiment_score
+                FROM market_news_archive
+                ORDER BY fetch_time DESC
+                LIMIT 5
+                """
+            )
+            recent = [
+                {
+                    "symbol": item[0],
+                    "headline": item[1],
+                    "fetch_time": item[2].isoformat() if item[2] else None,
+                    "sentiment_score": item[3],
+                }
+                for item in cur.fetchall()
+            ]
+            return {
+                "rows": int(row[0] or 0),
+                "symbols": int(row[1] or 0),
+                "oldest_fetch_time": row[2].isoformat() if row[2] else None,
+                "latest_fetch_time": row[3].isoformat() if row[3] else None,
+                "latest_published_at": row[4].isoformat() if row[4] else None,
+                "recent": recent,
+            }
 
 
 def get_bootstrap_state(key: str) -> str | None:
